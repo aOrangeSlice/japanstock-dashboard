@@ -1,0 +1,126 @@
+# 日股工作台 · クラウド同期 & デプロイ
+#
+# 設計（方案 A）：
+#   · 計算   : GitHub Actions（公開リポジトリ＝無料・分数制限なし）
+#   · DB永続 : japanstock.db（SQLite）は git に入れず、Release 資産
+#              タグ `db-snapshot` で毎回上書き（--clobber）
+#              → 資産が無い初回は自動で init + backfill（約 730 日）
+#   · 配信   : render_jp.py の成果物 HTML を gh-pages ブランチへ
+#              （リポジトリ Settings → Pages → Source: gh-pages を手動で一度だけ選択）
+#
+# スケジュール（cron は UTC）：
+#   02:45 UTC = 11:45 JST 前場引け直後 → sync --session noon
+#   06:45 UTC = 15:45 JST 大引け直後   → sync --session close
+#   土日は cron を飛ばすが、日本の祝日はコード内 is_trading_day() が
+#   自動スキップする（書き込みなし・HTML は前営業日のまま再デプロイ）。
+#
+# 手動実行：Actions タブ → Run workflow → session を空欄（自動判定）または
+#   noon / close を指定。初回は手動実行で yfinance の 429 挙動を必ず確認すること。
+
+name: jp-sync-deploy
+
+on:
+  schedule:
+    - cron: "45 2 * * 1-5"
+    - cron: "45 6 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      session:
+        description: "sync session（空欄＝現在時刻から自動判定 noon/close）"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: jp-sync-deploy
+  cancel-in-progress: false
+
+jobs:
+  sync-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TZ: Asia/Tokyo          # Python の date.today() を JST 基準に揃える
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Determine session
+        id: sess
+        run: |
+          if [ -n "${{ github.event.inputs.session }}" ]; then
+            echo "session=${{ github.event.inputs.session }}" >> "$GITHUB_OUTPUT"
+          elif [ "$(date -u +%H)" -lt 5 ]; then
+            echo "session=noon" >> "$GITHUB_OUTPUT"    # 02:45 UTC 前場引け
+          else
+            echo "session=close" >> "$GITHUB_OUTPUT"   # 06:45 UTC 大引け後
+          fi
+          echo ">> session = $(cat "$GITHUB_OUTPUT" | grep session | cut -d= -f2)"
+
+      - name: Restore japanstock.db from Release
+        id: db
+        run: |
+          if gh release view db-snapshot >/dev/null 2>&1; then
+            gh release download db-snapshot --pattern "japanstock.db" --clobber
+            echo "restored=1" >> "$GITHUB_OUTPUT"
+            ls -la japanstock.db
+          else
+            echo "restored=0" >> "$GITHUB_OUTPUT"
+            echo ">> Release 資産なし → 初回として init + backfill を実行"
+          fi
+
+      - name: First run (init + backfill)
+        if: steps.db.outputs.restored == '0'
+        run: |
+          python pipeline_jp.py init
+          python pipeline_jp.py backfill
+
+      - name: Sync (${{ steps.sess.outputs.session }})
+        run: python pipeline_jp.py sync --session ${{ steps.sess.outputs.session }}
+
+      - name: Render dashboard
+        run: python render_jp.py
+
+      - name: Pre-flight check (node 4-step)
+        run: node tools/check_dashboard_jp.js "日本株セクター・ローテーション監視.html"
+
+      - name: Checkpoint WAL before upload
+        run: |
+          python - <<'PY'
+          import sqlite3
+          con = sqlite3.connect("japanstock.db")
+          con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+          con.close()
+          PY
+
+      - name: Upload japanstock.db to Release
+        run: |
+          gh release view db-snapshot >/dev/null 2>&1 || \
+            gh release create db-snapshot --title "japanstock.db snapshot" \
+              --notes "SQLite スナップショット（jp-sync-deploy workflow が毎営業日 2 回自動更新）"
+          gh release upload db-snapshot japanstock.db --clobber
+
+      - name: Prepare site directory
+        run: |
+          mkdir -p site
+          cp "日本株セクター・ローテーション監視.html" site/index.html
+
+      - name: Deploy to gh-pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ github.token }}
+          publish_branch: gh-pages
+          publish_dir: ./site
+          force_orphan: true
+          commit_message: "deploy (${{ steps.sess.outputs.session }}) run ${{ github.run_number }}"

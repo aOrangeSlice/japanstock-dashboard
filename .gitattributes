@@ -1,0 +1,2 @@
+# 全テキストは LF で正規化（CI の run: ブロックでの CRLF 混入を防ぐ）
+* text=auto eol=lf

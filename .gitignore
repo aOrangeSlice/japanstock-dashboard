@@ -1,0 +1,18 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# SQLite 本体は GitHub Release 資産で永続化する（リポジトリには入れない）
+japanstock.db
+japanstock.db-wal
+japanstock.db-shm
+
+# 生成物（render_jp.py が出力）
+日本株セクター・ローテーション監視.html
+
+# 取数ログ（ローカルのみ）
+raw/
+
+# WorkBuddy ローカルデータ
+.workbuddy/
