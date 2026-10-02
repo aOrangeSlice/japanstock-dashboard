@@ -53,10 +53,12 @@ def align(con, table, code, dates, col, scale=1.0, nd=2):
 
 
 def build_bundle(con, narr):
-    # ① 営業日軸（庫内 ^N225 の日 K を基準。プローブで ^TOPX 不可のため代理 ETF と併用）
-    dates = [r[0] for r in q(con, "SELECT date FROM fact_index_daily "
-                                  "WHERE code='^N225' AND close IS NOT NULL "
-                                  "ORDER BY date")]
+    # ① 営業日軸：^N225 ∪ 1306.T 双锚并集（^N225 官方收盘有滞后、Close 可能
+    #    缺失 → 单锚会漏掉最新交易日；1306.T ETF 実時行情補位。缺值日 N225
+    #    KPI 由前端降级显示「—」）
+    dates = [r[0] for r in q(con, "SELECT DISTINCT date FROM fact_index_daily "
+                                  "WHERE code IN ('^N225','1306.T') "
+                                  "AND close IS NOT NULL ORDER BY date")]
     # ② 業種（17 ETF 代理）
     ind = {}
     for code, name in q(con, "SELECT code,name FROM dim_industry ORDER BY code"):

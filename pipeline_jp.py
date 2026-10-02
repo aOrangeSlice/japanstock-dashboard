@@ -22,7 +22,8 @@
   · 全部事実表 PRIMARY KEY(date,code) + UPSERT → 幂等，重跑不产生脏数据
   · **按日快照表**（fact_stock_daily）写入前必须先删当日再插，
     否则盘中快照的个股在收盘后会残留成幽灵行（不可逆）
-  · 交易日取「庫内 ^N225 の日 K 日期」（无上限）；无数据时才退回 yfinance 历法
+  · 交易日取「庫内 ^N225 ∪ 1306.T の日 K 日期并集」（^N225 官方收盘滞后时
+    由 1306.T ETF 补位，详见 jpcommon.CALENDAR_CODES）；无数据时才退回 yfinance
   · yfinance 批量调用是限流重灾区 → 统一走 _download() 分批 + 间隔 + 退避
 """
 import argparse
@@ -44,7 +45,7 @@ import logging  # noqa: E402
 
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 
-from jpcommon import DB_PATH, IND17, INDICES_JP, RAW_DIR  # noqa: E402
+from jpcommon import DB_PATH, IND17, INDICES_JP, RAW_DIR, CALENDAR_CODES  # noqa: E402
 from universe_seed import UNIVERSE_SEED, IND_NAME_TO_CODE  # noqa: E402
 
 E8 = 1e8
@@ -204,25 +205,34 @@ def log_fetch(con, cmd, nrows, note=""):
 
 # ---------------------------------------------------------------- 交易日
 def trading_days(start, end):
-    """交易日列表：优先取庫内 ^N225 の日 K 日期（最准且无上限）"""
+    """交易日列表：^N225 ∪ 1306.T 双锚并集（^N225 官方收盘有滞后，
+    缺日时由 1306.T ETF 补位；详见 jpcommon.CALENDAR_CODES 注释）"""
+    marks = ",".join("?" * len(CALENDAR_CODES))
     con = connect()
-    rows = con.execute("SELECT date FROM fact_index_daily WHERE code='^N225' "
-                       "AND date>=? AND date<=? ORDER BY date",
-                       (start, end)).fetchall()
+    rows = con.execute(
+        f"SELECT DISTINCT date FROM fact_index_daily WHERE code IN ({marks}) "
+        f"AND date>=? AND date<=? ORDER BY date",
+        (*CALENDAR_CODES, start, end)).fetchall()
     con.close()
     return [r[0] for r in rows]
 
 
 def is_trading_day(d):
-    """单日守卫：庫内已有该日的 ^N225 行即视为已确认交易日；
-    庫内无该行时用 yfinance 现拉一次 ^N225 判断（节假日会返回空）。"""
+    """单日守卫：庫内 ^N225/1306.T 任一有该日行即视为交易日；
+    庫内无行时现拉 yfinance 判断（优先 ^N225，缺则退 1306.T；
+    节假日两者都返回空）。"""
     con = connect()
-    hit = con.execute("SELECT 1 FROM fact_index_daily WHERE code='^N225' AND date=?",
-                      (d,)).fetchone()
+    marks = ",".join("?" * len(CALENDAR_CODES))
+    hit = con.execute(
+        f"SELECT 1 FROM fact_index_daily WHERE code IN ({marks}) AND date=?",
+        (*CALENDAR_CODES, d)).fetchone()
     con.close()
     if hit:
         return True
     got = download(["^N225"], start=d, end=d)
+    if got:
+        return True
+    got = download(["1306.T"], start=d, end=d)
     return bool(got)
 
 
@@ -484,10 +494,12 @@ def fetch_intraday(start=None, end=None):
         log("  intraday: 無データ → スキップ")
         return 0
 
-    # 営業日ガード：庫内 ^N225 の日 K にある日付のみを書く（週末・祝日の混入防止）
+    # 営業日ガード：^N225 ∪ 1306.T 双锚并集（^N225 收盘滞后时 1306.T 补位）
     con = connect()
+    marks = ",".join("?" * len(CALENDAR_CODES))
     cal = {r[0] for r in con.execute(
-        "SELECT date FROM fact_index_daily WHERE code='^N225'")}
+        f"SELECT date FROM fact_index_daily WHERE code IN ({marks})",
+        CALENDAR_CODES)}
 
     # 日付 → コード → [(HH:MM, row), ...]
     per = {}
@@ -594,8 +606,13 @@ def cmd_sync(session="close"):
         return
     log(f"=== close 大引け後（{today}）===")
     con = connect()
-    mx = con.execute("SELECT MAX(date) FROM fact_index_daily "
-                     "WHERE code='^N225'").fetchone()[0]
+    # mx 取双锚并集的最新日（^N225 收盘滞后缺日时会退回偏旧日期）
+    mx = con.execute(
+        "SELECT MAX(mx) FROM ("
+        "  SELECT MAX(date) AS mx FROM fact_index_daily WHERE code=?"
+        "  UNION ALL"
+        "  SELECT MAX(date) FROM fact_index_daily WHERE code=?)",
+        CALENDAR_CODES).fetchone()[0]
     con.close()
     start = ((date.fromisoformat(mx) - timedelta(days=7)).isoformat()
              if mx else (date.today() - timedelta(days=30)).isoformat())
